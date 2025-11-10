@@ -42,14 +42,14 @@ class Database:
         # Create views for each data type
         self.conn.execute(f"""
             CREATE VIEW IF NOT EXISTS observations_aq AS
-            SELECT * FROM read_parquet('{self.parquet_path}/aq/*.parquet',
+            SELECT * FROM read_parquet('{self.parquet_path}/aq/**/*.parquet',
                                        hive_partitioning=true,
                                        union_by_name=true)
         """)
 
         self.conn.execute(f"""
             CREATE VIEW IF NOT EXISTS observations_met AS
-            SELECT * FROM read_parquet('{self.parquet_path}/met/*.parquet',
+            SELECT * FROM read_parquet('{self.parquet_path}/met/**/*.parquet',
                                        hive_partitioning=true,
                                        union_by_name=true)
         """)

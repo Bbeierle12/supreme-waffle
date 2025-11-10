@@ -1,0 +1,16 @@
+bakersfield:
+  name: "Bakersfield, CA"
+  timezone: "America/Los_Angeles"
+  bounds:
+    lat: [35.25, 35.45]
+    lon: [-119.15, -118.85]
+  sensors:
+    purpleair: [122842, 122848, 14633]
+    epa: ["06-029-0014"]
+  qa_rules:
+    spike_threshold: 4.0  # z-score using MAD
+    humidity_correction: "barkjohn"
+    ab_diff_absolute: 5.0  # µg/m³
+    ab_diff_relative: 0.20  # 20%
+    high_humidity_threshold: 85.0  # RH%
+    stale_data_hours: 2.0

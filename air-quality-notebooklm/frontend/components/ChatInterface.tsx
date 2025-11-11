@@ -3,19 +3,13 @@
 import { useState, useRef, useEffect } from 'react'
 import { Send, AlertCircle } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
-import axios from 'axios'
+import axios, { AxiosError } from 'axios'
+import { Message, ToolCall, QueryResponse, ErrorResponse } from '@/types/api'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-interface Message {
-  role: 'user' | 'assistant'
-  content: string
-  toolCalls?: any[]
-  timestamp: Date
-}
-
 interface ChatInterfaceProps {
-  onToolCall: (data: any) => void
+  onToolCall: (data: ToolCall[]) => void
 }
 
 export default function ChatInterface({ onToolCall }: ChatInterfaceProps) {
@@ -50,7 +44,7 @@ export default function ChatInterface({ onToolCall }: ChatInterfaceProps) {
     setError(null)
 
     try {
-      const response = await axios.post(`${API_URL}/query`, {
+      const response = await axios.post<QueryResponse>(`${API_URL}/query`, {
         question: userMessage.content,
         location: 'bakersfield'
       })
@@ -71,8 +65,14 @@ export default function ChatInterface({ onToolCall }: ChatInterfaceProps) {
 
       setMessages(prev => [...prev, assistantMessage])
 
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to get response')
+    } catch (err) {
+      const axiosError = err as AxiosError<ErrorResponse>
+      const errorMessage =
+        axiosError.response?.data?.error ||
+        axiosError.response?.data?.detail ||
+        axiosError.message ||
+        'Failed to get response'
+      setError(errorMessage)
       console.error('Query error:', err)
     } finally {
       setIsLoading(false)

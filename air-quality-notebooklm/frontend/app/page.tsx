@@ -4,10 +4,11 @@ import { useState } from 'react'
 import ChatInterface from '@/components/ChatInterface'
 import DataInspector from '@/components/DataInspector'
 import { FileText, Database } from 'lucide-react'
+import { ToolCall } from '@/types/api'
 
 export default function Home() {
   const [showInspector, setShowInspector] = useState(false)
-  const [inspectorData, setInspectorData] = useState<any>(null)
+  const [inspectorData, setInspectorData] = useState<ToolCall[] | null>(null)
 
   return (
     <main className="flex min-h-screen flex-col bg-gray-50 dark:bg-gray-900">

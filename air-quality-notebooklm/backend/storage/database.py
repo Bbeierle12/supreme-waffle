@@ -122,6 +122,52 @@ class Database:
             )
         """)
 
+        # Create indexes for better query performance
+        self._create_indexes()
+
+    def _create_indexes(self):
+        """Create indexes on tables for optimized queries."""
+        # Events table indexes - for time-based event queries
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_start_ts ON events(start_ts)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_type_start ON events(type, start_ts)
+        """)
+
+        # Documents table indexes - for document lookup
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_documents_added_at ON documents(added_at)
+        """)
+
+        # Chunks table indexes - for RAG queries
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(page)
+        """)
+
+        # Lineage table indexes - for data provenance queries
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lineage_record_id ON lineage(record_id)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lineage_table_name ON lineage(table_name)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lineage_fetched_at ON lineage(fetched_at)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lineage_api_source ON lineage(api_source)
+        """)
+
     def write_parquet(
         self,
         data: pd.DataFrame,
@@ -230,6 +276,68 @@ class Database:
             self.connect()
         self.conn.execute("VACUUM")
         self.conn.execute("ANALYZE")
+
+    def explain_query(self, sql: str) -> str:
+        """
+        Get query execution plan for optimization analysis.
+
+        Args:
+            sql: SQL query to analyze
+
+        Returns:
+            Query plan as string
+        """
+        if not self.conn:
+            self.connect()
+
+        plan = self.conn.execute(f"EXPLAIN {sql}").fetchall()
+        return "\n".join([str(row) for row in plan])
+
+    def optimize_parquet_files(self):
+        """
+        Optimize Parquet files by consolidating small files.
+
+        This reduces the number of file reads and improves query performance.
+        Should be run periodically (e.g., daily) as a maintenance task.
+        """
+        # For each partition, consolidate files if there are too many
+        for data_type in ['aq', 'met']:
+            output_dir = self.parquet_path / data_type
+
+            if not output_dir.exists():
+                continue
+
+            # Group by date partition
+            for partition_dir in output_dir.glob("date=*"):
+                parquet_files = list(partition_dir.glob("*.parquet"))
+
+                # If more than 10 files in a partition, consolidate
+                if len(parquet_files) > 10:
+                    # Read all files for this partition
+                    dfs = [pd.read_parquet(f) for f in parquet_files]
+                    if not dfs:
+                        continue
+
+                    combined = pd.concat(dfs, ignore_index=True)
+
+                    # Sort by timestamp for better compression
+                    if 'ts' in combined.columns:
+                        combined = combined.sort_values('ts')
+
+                    # Write consolidated file
+                    consolidated_file = partition_dir / f"consolidated_{datetime.now().timestamp()}.parquet"
+                    combined.to_parquet(
+                        consolidated_file,
+                        engine='pyarrow',
+                        compression='snappy',
+                        index=False
+                    )
+
+                    # Remove old files
+                    for old_file in parquet_files:
+                        old_file.unlink()
+
+                    print(f"Consolidated {len(parquet_files)} files in {partition_dir.name}")
 
 
 # Global database instance

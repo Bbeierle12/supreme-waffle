@@ -2,9 +2,21 @@
 
 import { useState } from 'react'
 import { ChevronDown, ChevronRight, AlertTriangle, CheckCircle } from 'lucide-react'
+import {
+  ToolCall,
+  ResultData,
+  isMetricSummaryResult,
+  isExceedancesResult,
+  isSpikesResult,
+  isCorrelationResult,
+  isInversionsResult,
+  Exceedance,
+  Spike,
+  Inversion,
+} from '@/types/api'
 
 interface DataInspectorProps {
-  data: any
+  data: ToolCall[] | null
 }
 
 export default function DataInspector({ data }: DataInspectorProps) {
@@ -40,7 +52,7 @@ export default function DataInspector({ data }: DataInspectorProps) {
       </h3>
 
       <div className="space-y-3">
-        {data.map((toolCall: any, index: number) => {
+        {data.map((toolCall, index: number) => {
           const isExpanded = expandedTools.has(index)
           const success = toolCall.result?.success !== false
           const result = toolCall.result?.result || toolCall.result
@@ -136,16 +148,16 @@ export default function DataInspector({ data }: DataInspectorProps) {
   )
 }
 
-function renderResult(result: any) {
+function renderResult(result: ResultData | undefined) {
   if (!result) return null
 
-  // Handle different result types
-  if (result.value !== undefined) {
+  // Handle different result types using type guards
+  if (isMetricSummaryResult(result)) {
     // Metric summary
     return (
       <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded p-3">
         <div className="text-2xl font-bold text-blue-900 dark:text-blue-100">
-          {result.value?.toFixed(1)} {result.unit}
+          {result.value.toFixed(1)} {result.unit}
         </div>
         <div className="text-sm text-gray-600 dark:text-gray-400 mt-1">
           {result.metric} ({result.aggregate})
@@ -157,15 +169,15 @@ function renderResult(result: any) {
     )
   }
 
-  if (result.exceedances) {
+  if (isExceedancesResult(result)) {
     // Exceedances
     return (
       <div>
         <div className="font-medium mb-2">
-          {result.total_count} exceedances found
+          {result.total} exceedances found
         </div>
         <div className="space-y-2">
-          {result.exceedances.slice(0, 5).map((exc: any, i: number) => (
+          {result.exceedances.slice(0, 5).map((exc: Exceedance, i: number) => (
             <div
               key={i}
               className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded p-2 text-sm"
@@ -181,22 +193,22 @@ function renderResult(result: any) {
     )
   }
 
-  if (result.spikes) {
+  if (isSpikesResult(result)) {
     // Spikes
     return (
       <div>
         <div className="font-medium mb-2">
-          {result.total_count} spikes detected ({result.method})
+          {result.total} spikes detected
         </div>
         <div className="space-y-2">
-          {result.spikes.slice(0, 5).map((spike: any, i: number) => (
+          {result.spikes.slice(0, 5).map((spike: Spike, i: number) => (
             <div
               key={i}
               className="bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded p-2 text-sm"
             >
-              <div className="font-medium">{spike.timestamp}</div>
+              <div className="font-medium">{spike.ts}</div>
               <div className="text-gray-600 dark:text-gray-400">
-                Value: {spike.value.toFixed(1)} (z-score: {spike.z_score.toFixed(2)})
+                PM2.5: {spike.pm25.toFixed(1)} µg/m³ (rate: {spike.change_rate.toFixed(1)})
               </div>
             </div>
           ))}
@@ -205,7 +217,7 @@ function renderResult(result: any) {
     )
   }
 
-  if (result.correlation !== undefined) {
+  if (isCorrelationResult(result)) {
     // Correlation
     return (
       <div className="bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800 rounded p-3">
@@ -213,7 +225,7 @@ function renderResult(result: any) {
           r = {result.correlation.toFixed(3)}
         </div>
         <div className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-          p-value: {result.p_value?.toFixed(4) || 'N/A'}
+          p-value: {result.p_value.toFixed(4)}
         </div>
         <div className="text-xs text-gray-500 dark:text-gray-500 mt-1">
           n = {result.n_samples} samples
@@ -227,25 +239,27 @@ function renderResult(result: any) {
     )
   }
 
-  if (result.inversions) {
+  if (isInversionsResult(result)) {
     // Inversions
     return (
       <div>
         <div className="font-medium mb-2">
-          {result.total_count} inversion periods detected
-        </div>
-        <div className="text-xs text-yellow-700 dark:text-yellow-400 mb-2">
-          ⚠️ {result.caveat}
+          {result.total} inversion periods detected
         </div>
         <div className="space-y-2">
-          {result.inversions.map((inv: any, i: number) => (
+          {result.inversions.map((inv: Inversion, i: number) => (
             <div
               key={i}
               className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800 rounded p-2 text-sm"
             >
-              <div className="font-medium">{inv.date}</div>
+              <div className="font-medium">
+                {inv.start_ts} - {inv.end_ts}
+              </div>
               <div className="text-gray-600 dark:text-gray-400">
-                Confidence: {(inv.confidence * 100).toFixed(0)}%
+                Duration: {inv.duration_hours} hours | Confidence: {inv.confidence}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">
+                Evidence: {inv.evidence.join(', ')}
               </div>
             </div>
           ))}

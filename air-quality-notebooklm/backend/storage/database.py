@@ -39,20 +39,46 @@ class Database:
 
     def _setup_schema(self):
         """Create database schema and views over Parquet files."""
-        # Create views for each data type
-        self.conn.execute(f"""
-            CREATE VIEW IF NOT EXISTS observations_aq AS
-            SELECT * FROM read_parquet('{self.parquet_path}/aq/**/*.parquet',
-                                       hive_partitioning=true,
-                                       union_by_name=true)
-        """)
+        # Create views for each data type, handling case where no files exist yet
+        try:
+            self.conn.execute(f"""
+                CREATE VIEW IF NOT EXISTS observations_aq AS
+                SELECT * FROM read_parquet('{self.parquet_path}/aq/**/*.parquet',
+                                           hive_partitioning=true,
+                                           union_by_name=true)
+            """)
+        except Exception as e:
+            # No parquet files yet, create empty view
+            print(f"Warning: No AQ parquet files found, creating empty view: {e}")
+            self.conn.execute("""
+                CREATE VIEW IF NOT EXISTS observations_aq AS
+                SELECT * FROM (VALUES
+                    (NULL::TIMESTAMP, NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE,
+                     NULL::DOUBLE, NULL::INTEGER, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, NULL::JSON)
+                ) t(ts, source, sensor_id, pm25_raw, pm25_corr, pm10_raw, qa_flags, "window", lat, lon, metadata)
+                WHERE FALSE
+            """)
 
-        self.conn.execute(f"""
-            CREATE VIEW IF NOT EXISTS observations_met AS
-            SELECT * FROM read_parquet('{self.parquet_path}/met/**/*.parquet',
-                                       hive_partitioning=true,
-                                       union_by_name=true)
-        """)
+        try:
+            self.conn.execute(f"""
+                CREATE VIEW IF NOT EXISTS observations_met AS
+                SELECT * FROM read_parquet('{self.parquet_path}/met/**/*.parquet',
+                                           hive_partitioning=true,
+                                           union_by_name=true)
+            """)
+        except Exception as e:
+            # No parquet files yet, create empty view
+            print(f"Warning: No weather parquet files found, creating empty view: {e}")
+            self.conn.execute("""
+                CREATE VIEW IF NOT EXISTS observations_met AS
+                SELECT * FROM (VALUES
+                    (NULL::TIMESTAMP, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, NULL::DOUBLE,
+                     NULL::DOUBLE, NULL::DOUBLE, NULL::DOUBLE, NULL::DOUBLE, NULL::VARCHAR,
+                     NULL::DOUBLE, NULL::DOUBLE)
+                ) t(ts, station_id, temp_c, rh, wind_speed_ms, wind_dir_deg, pressure_mb,
+                    stability_idx, mixing_height_m, "window", lat, lon)
+                WHERE FALSE
+            """)
 
         self.conn.execute(f"""
             CREATE TABLE IF NOT EXISTS events (

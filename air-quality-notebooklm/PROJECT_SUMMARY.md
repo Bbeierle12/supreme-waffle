@@ -276,4 +276,4 @@ Ready to answer research questions about air quality with proper scientific rigo
 
 **Built**: November 2024
 **Status**: Production-ready MVP
-**Purpose**: Personal research tool for atmospheric science
+**Purpose**: Personal research tool for atmospheric science.

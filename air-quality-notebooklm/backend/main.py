@@ -3,19 +3,41 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, field_validator, ConfigDict, ValidationError as PydanticValidationError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import json
+import re
+import traceback
 
 from config import settings, location_config
 from storage.database import get_db
 from llm.orchestrator import AnalysisOrchestrator
 from ingestion.purpleair import fetch_and_store
 from ingestion.weather import fetch_and_store_weather
+from exceptions import (
+    AirQualityException,
+    ValidationError,
+    DataNotFoundError,
+    DatabaseError,
+    ExternalAPIError,
+    ConfigurationError,
+    RateLimitError,
+)
+from logging_config import setup_logging, get_logger
+from rate_limiting import limiter, RATE_LIMITS
+from slowapi.errors import RateLimitExceeded
 
+
+# Set up logging
+log_dir = settings.database_path.parent / "logs"
+logger = setup_logging(
+    log_level=settings.log_level,
+    log_file=log_dir / "app.log" if log_dir else None
+)
 
 # Scheduler for periodic data updates
 scheduler = AsyncIOScheduler()
@@ -25,11 +47,11 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
     # Startup
-    print("Starting Air Quality NotebookLM...")
+    logger.info("Starting Air Quality NotebookLM...")
 
     # Initialize database
     db = get_db()
-    print(f"Database initialized at {settings.database_path}")
+    logger.info(f"Database initialized at {settings.database_path}")
 
     # Schedule data updates (every 10 minutes)
     if settings.purpleair_api_key:
@@ -67,6 +89,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Add rate limiter to app state
+app.state.limiter = limiter
+
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
@@ -77,29 +102,209 @@ app.add_middleware(
 )
 
 
+# Global exception handlers
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Handle rate limit exceeded errors."""
+    logger.warning(
+        f"Rate limit exceeded for {request.url.path}",
+        extra={
+            "path": request.url.path,
+            "client": request.client.host if request.client else "unknown"
+        }
+    )
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "error": "Rate limit exceeded",
+            "detail": "Too many requests. Please try again later.",
+            "type": "RateLimitError"
+        },
+        headers={"Retry-After": "60"}  # Suggest retry after 60 seconds
+    )
+
+
+@app.exception_handler(AirQualityException)
+async def air_quality_exception_handler(request: Request, exc: AirQualityException):
+    """Handle custom application exceptions."""
+    logger.error(
+        f"Application error: {exc.message}",
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+            "details": exc.details,
+            "status_code": exc.status_code
+        }
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.message,
+            "details": exc.details,
+            "type": exc.__class__.__name__
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle Pydantic validation errors."""
+    logger.warning(
+        f"Validation error on {request.url.path}: {exc.errors()}",
+        extra={"path": request.url.path, "method": request.method}
+    )
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "Validation failed",
+            "details": exc.errors(),
+            "type": "ValidationError"
+        }
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle FastAPI HTTP exceptions."""
+    logger.warning(
+        f"HTTP {exc.status_code} on {request.url.path}: {exc.detail}",
+        extra={"path": request.url.path, "method": request.method}
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "type": "HTTPException"
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions."""
+    logger.error(
+        f"Unexpected error on {request.url.path}: {str(exc)}",
+        extra={
+            "path": request.url.path,
+            "method": request.method,
+            "traceback": traceback.format_exc()
+        }
+    )
+    # Don't expose internal error details in production
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "An unexpected error occurred",
+            "type": "InternalServerError",
+            # Only include details in development
+            "details": str(exc) if settings.reload else None
+        }
+    )
+
+
 # Request/Response models
 class QueryRequest(BaseModel):
-    question: str
-    location: Optional[str] = "bakersfield"
+    """Request model for query endpoint with comprehensive validation."""
+
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The question to ask about air quality data"
+    )
+    location: str = Field(
+        default="bakersfield",
+        min_length=1,
+        max_length=50,
+        pattern="^[a-z0-9_-]+$",
+        description="Location identifier (lowercase alphanumeric, underscores, and hyphens only)"
+    )
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator('question')
+    @classmethod
+    def validate_question(cls, v: str) -> str:
+        """Validate question content."""
+        if not v.strip():
+            raise ValueError('Question cannot be empty or only whitespace')
+
+        # Check for potential injection attempts
+        suspicious_patterns = [
+            # XSS patterns
+            r'<script',
+            r'javascript:',
+            r'onerror=',
+            # Code injection patterns
+            r'eval\(',
+            r'__import__',
+            r'exec\(',
+            # SQL injection patterns
+            r';\s*drop\s+table',
+            r';\s*delete\s+from',
+            r';\s*update\s+',
+            r';\s*insert\s+into',
+            r'union\s+select',
+            r'--\s*$',
+        ]
+
+        for pattern in suspicious_patterns:
+            if re.search(pattern, v, re.IGNORECASE):
+                raise ValueError(f'Question contains potentially unsafe content')
+
+        return v.strip()
+
+    @field_validator('location')
+    @classmethod
+    def validate_location(cls, v: str) -> str:
+        """Validate location exists in configuration."""
+        v = v.lower().strip()
+
+        # Check if location exists
+        available_locations = location_config.list_locations()
+        if v not in available_locations:
+            raise ValueError(
+                f'Invalid location: {v}. Available locations: {", ".join(available_locations)}'
+            )
+
+        return v
+
+
+class ToolCall(BaseModel):
+    """Model for individual tool call."""
+    tool_name: str = Field(..., max_length=100)
+    tool_input: dict
+    result: Optional[dict] = None
+
+
+class Answer(BaseModel):
+    """Model for query answer."""
+    text: str = Field(..., min_length=1)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    sources: Optional[list[str]] = None
 
 
 class QueryResponse(BaseModel):
-    answer: dict
-    tool_calls: list
-    rounds: int
-    model: str
+    """Response model for query endpoint."""
+    answer: Answer
+    tool_calls: list[ToolCall]
+    rounds: int = Field(..., ge=1, le=100)
+    model: str = Field(..., max_length=100)
 
 
 class StatusResponse(BaseModel):
-    status: str
+    """Response model for status endpoint."""
+    status: str = Field(..., pattern="^(healthy|degraded|unhealthy)$")
     database: str
     data_range: Optional[dict] = None
-    sensors: list
+    sensors: list[str]
 
 
 # Background tasks
 async def update_air_quality():
     """Background task to update air quality data."""
+    task_logger = get_logger("tasks.air_quality")
+
     try:
         location = location_config.get_location(settings.default_location)
         sensor_ids = location["sensors"]["purpleair"]
@@ -111,14 +316,22 @@ async def update_air_quality():
             location,
             db
         )
-        print(f"Updated air quality data at {datetime.now()}")
+        task_logger.info(f"Successfully updated air quality data at {datetime.now()}")
 
+    except KeyError as e:
+        task_logger.error(f"Configuration error: Missing key {e}")
+    except ExternalAPIError as e:
+        task_logger.error(f"PurpleAir API error: {e.message}", extra={"details": e.details})
+    except DatabaseError as e:
+        task_logger.error(f"Database error during air quality update: {e.message}")
     except Exception as e:
-        print(f"Error updating air quality: {e}")
+        task_logger.exception(f"Unexpected error updating air quality: {e}")
 
 
 async def update_weather():
     """Background task to update weather data."""
+    task_logger = get_logger("tasks.weather")
+
     try:
         location = location_config.get_location(settings.default_location)
         db = get_db()
@@ -128,10 +341,16 @@ async def update_weather():
             location,
             db
         )
-        print(f"Updated weather data at {datetime.now()}")
+        task_logger.info(f"Successfully updated weather data at {datetime.now()}")
 
+    except KeyError as e:
+        task_logger.error(f"Configuration error: Missing key {e}")
+    except ExternalAPIError as e:
+        task_logger.error(f"Weather API error: {e.message}", extra={"details": e.details})
+    except DatabaseError as e:
+        task_logger.error(f"Database error during weather update: {e.message}")
     except Exception as e:
-        print(f"Error updating weather: {e}")
+        task_logger.exception(f"Unexpected error updating weather: {e}")
 
 
 # API endpoints
@@ -146,7 +365,8 @@ async def root():
 
 
 @app.get("/status", response_model=StatusResponse)
-async def get_status():
+@limiter.limit(RATE_LIMITS["status"])
+async def get_status(request: Request):
     """Get system status and data availability."""
     db = get_db()
 
@@ -172,39 +392,96 @@ async def get_status():
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
+@limiter.limit(RATE_LIMITS["query"])
+async def query(request: Request, query_request: QueryRequest):
     """
     Answer a research question about air quality data.
 
     This endpoint uses Claude with safe tool calling to analyze data.
     """
+    endpoint_logger = get_logger("api.query")
+
     if not settings.anthropic_api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="Anthropic API key not configured"
+        raise ConfigurationError(
+            "Anthropic API key not configured",
+            details={"setting": "ANTHROPIC_API_KEY"}
         )
 
     # Initialize orchestrator
     orchestrator = AnalysisOrchestrator(settings.anthropic_api_key)
 
     try:
+        endpoint_logger.info(
+            f"Processing query: {query_request.question[:100]}...",
+            extra={"location": query_request.location}
+        )
+
         # Get answer
         result = orchestrator.answer_query(
-            question=request.question,
-            location=request.location
+            question=query_request.question,
+            location=query_request.location
         )
 
-        return QueryResponse(**result)
+        # Transform to response model
+        answer_data = result.get("answer", {})
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing query: {str(e)}"
+        # Map confidence string to float (0.0-1.0)
+        confidence_map = {"low": 0.3, "medium": 0.6, "high": 0.9}
+        confidence_value = confidence_map.get(
+            answer_data.get("confidence", "medium"), 0.6
         )
+
+        # Extract source references
+        sources = [
+            f"{src.get('tool', 'unknown')}({', '.join(f'{k}={v}' for k, v in src.get('params', {}).items())})"
+            for src in answer_data.get("sources", [])
+        ]
+
+        answer = Answer(
+            text=answer_data.get("text", "No response generated"),
+            confidence=confidence_value,
+            sources=sources if sources else None
+        )
+
+        # Transform tool calls
+        tool_calls = [
+            ToolCall(
+                tool_name=tc.get("tool", "unknown"),
+                tool_input=tc.get("params", {}),
+                result=tc.get("result")
+            )
+            for tc in result.get("tool_calls", [])
+        ]
+
+        endpoint_logger.info(
+            f"Query completed in {result.get('rounds', 1)} rounds",
+            extra={"tool_calls": len(tool_calls)}
+        )
+
+        return QueryResponse(
+            answer=answer,
+            tool_calls=tool_calls,
+            rounds=result.get("rounds", 1),
+            model=result.get("model", "unknown")
+        )
+
+    except PydanticValidationError as e:
+        # Pydantic validation errors from response model
+        raise ValidationError(
+            "Failed to construct response",
+            details={"errors": e.errors()}
+        )
+    except KeyError as e:
+        raise DataNotFoundError(
+            f"Missing required data: {e}",
+            details={"key": str(e)}
+        )
+    # Let other exceptions bubble up to global handler
 
 
 @app.post("/query/stream")
-async def query_stream(request: QueryRequest):
+@limiter.limit(RATE_LIMITS["query_stream"])
+async def query_stream(request: Request, query_request: QueryRequest):
     """
     Stream answer to a research question (SSE).
 
@@ -215,14 +492,14 @@ async def query_stream(request: QueryRequest):
         orchestrator = AnalysisOrchestrator(settings.anthropic_api_key)
 
         # Send initial message
-        yield f"data: {json.dumps({'type': 'start', 'question': request.question})}\n\n"
+        yield f"data: {json.dumps({'type': 'start', 'question': query_request.question})}\n\n"
 
         try:
             # This is a simplified version - would need to modify orchestrator
             # to yield intermediate results
             result = orchestrator.answer_query(
-                question=request.question,
-                location=request.location
+                question=query_request.question,
+                location=query_request.location
             )
 
             # Send tool calls
@@ -243,17 +520,44 @@ async def query_stream(request: QueryRequest):
     )
 
 
-@app.post("/ingest/trigger")
-async def trigger_ingestion():
-    """Manually trigger data ingestion (useful for testing)."""
-    await update_air_quality()
-    await update_weather()
+class IngestResponse(BaseModel):
+    """Response model for ingestion trigger."""
+    status: str = Field(..., pattern="^(completed|failed|in_progress)$")
+    message: Optional[str] = None
 
-    return {"status": "completed"}
+
+@app.post("/ingest/trigger", response_model=IngestResponse)
+@limiter.limit(RATE_LIMITS["ingest"])
+async def trigger_ingestion(request: Request):
+    """
+    Manually trigger data ingestion (useful for testing).
+
+    Note: In production, this endpoint should require authentication.
+    """
+    endpoint_logger = get_logger("api.ingest")
+
+    endpoint_logger.info("Manual ingestion triggered")
+
+    try:
+        await update_air_quality()
+        await update_weather()
+
+        endpoint_logger.info("Manual ingestion completed successfully")
+
+        return IngestResponse(
+            status="completed",
+            message="Data ingestion completed successfully"
+        )
+    except (ExternalAPIError, DatabaseError) as e:
+        # These errors are already logged in the background tasks
+        endpoint_logger.error(f"Ingestion failed: {e.message}")
+        raise
+    # Let other exceptions bubble up to global handler
 
 
 @app.get("/locations")
-async def list_locations():
+@limiter.limit(RATE_LIMITS["locations"])
+async def list_locations(request: Request):
     """List available locations."""
     locations = location_config.list_locations()
 

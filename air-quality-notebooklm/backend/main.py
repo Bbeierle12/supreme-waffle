@@ -15,9 +15,7 @@ import traceback
 
 from config import settings, location_config
 from storage.database import get_db
-from llm.orchestrator import AnalysisOrchestrator
-from ingestion.purpleair import fetch_and_store
-from ingestion.weather import fetch_and_store_weather
+from services import QueryService, StatusService, IngestionService
 from exceptions import (
     AirQualityException,
     ValidationError,
@@ -42,16 +40,35 @@ logger = setup_logging(
 # Scheduler for periodic data updates
 scheduler = AsyncIOScheduler()
 
+# Service instances (initialized in lifespan)
+query_service: Optional[QueryService] = None
+status_service: Optional[StatusService] = None
+ingestion_service: Optional[IngestionService] = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown."""
+    global query_service, status_service, ingestion_service
+
     # Startup
     logger.info("Starting Air Quality NotebookLM...")
 
     # Initialize database
     db = get_db()
     logger.info(f"Database initialized at {settings.database_path}")
+
+    # Initialize services
+    query_service = QueryService(settings.anthropic_api_key) if settings.anthropic_api_key else None
+    status_service = StatusService(db, settings.database_path)
+    ingestion_service = IngestionService(
+        db,
+        location_config,
+        settings.purpleair_api_key,
+        settings.openweather_api_key,
+        settings.default_location
+    )
+    logger.info("Services initialized")
 
     # Schedule data updates (every 10 minutes)
     if settings.purpleair_api_key:
@@ -153,11 +170,26 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         f"Validation error on {request.url.path}: {exc.errors()}",
         extra={"path": request.url.path, "method": request.method}
     )
+
+    # Serialize errors properly (Pydantic V2 may include non-serializable objects)
+    errors = []
+    for error in exc.errors():
+        error_dict = {
+            "type": error.get("type"),
+            "loc": error.get("loc"),
+            "msg": error.get("msg"),
+            "input": str(error.get("input")) if error.get("input") else None
+        }
+        # Convert ctx values to strings if they exist
+        if "ctx" in error and error["ctx"]:
+            error_dict["ctx"] = {k: str(v) for k, v in error["ctx"].items()}
+        errors.append(error_dict)
+
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "error": "Validation failed",
-            "details": exc.errors(),
+            "details": errors,
             "type": "ValidationError"
         }
     )
@@ -303,54 +335,22 @@ class StatusResponse(BaseModel):
 # Background tasks
 async def update_air_quality():
     """Background task to update air quality data."""
-    task_logger = get_logger("tasks.air_quality")
-
-    try:
-        location = location_config.get_location(settings.default_location)
-        sensor_ids = location["sensors"]["purpleair"]
-
-        db = get_db()
-        await fetch_and_store(
-            settings.purpleair_api_key,
-            sensor_ids,
-            location,
-            db
-        )
-        task_logger.info(f"Successfully updated air quality data at {datetime.now()}")
-
-    except KeyError as e:
-        task_logger.error(f"Configuration error: Missing key {e}")
-    except ExternalAPIError as e:
-        task_logger.error(f"PurpleAir API error: {e.message}", extra={"details": e.details})
-    except DatabaseError as e:
-        task_logger.error(f"Database error during air quality update: {e.message}")
-    except Exception as e:
-        task_logger.exception(f"Unexpected error updating air quality: {e}")
+    if ingestion_service:
+        try:
+            await ingestion_service.ingest_air_quality()
+        except Exception:
+            # Errors are already logged in the service
+            pass
 
 
 async def update_weather():
     """Background task to update weather data."""
-    task_logger = get_logger("tasks.weather")
-
-    try:
-        location = location_config.get_location(settings.default_location)
-        db = get_db()
-
-        await fetch_and_store_weather(
-            settings.openweather_api_key,
-            location,
-            db
-        )
-        task_logger.info(f"Successfully updated weather data at {datetime.now()}")
-
-    except KeyError as e:
-        task_logger.error(f"Configuration error: Missing key {e}")
-    except ExternalAPIError as e:
-        task_logger.error(f"Weather API error: {e.message}", extra={"details": e.details})
-    except DatabaseError as e:
-        task_logger.error(f"Database error during weather update: {e.message}")
-    except Exception as e:
-        task_logger.exception(f"Unexpected error updating weather: {e}")
+    if ingestion_service:
+        try:
+            await ingestion_service.ingest_weather()
+        except Exception:
+            # Errors are already logged in the service
+            pass
 
 
 # API endpoints
@@ -368,27 +368,11 @@ async def root():
 @limiter.limit(RATE_LIMITS["status"])
 async def get_status(request: Request):
     """Get system status and data availability."""
-    db = get_db()
+    if not status_service:
+        raise ConfigurationError("Status service not initialized")
 
-    # Get data range
-    min_ts, max_ts = db.get_time_range("aq")
-
-    data_range = None
-    if min_ts and max_ts:
-        data_range = {
-            "start": str(min_ts),
-            "end": str(max_ts)
-        }
-
-    # Get sensors
-    sensors = db.get_sensors()
-
-    return StatusResponse(
-        status="healthy",
-        database=str(settings.database_path),
-        data_range=data_range,
-        sensors=sensors
-    )
+    status_data = status_service.get_system_status()
+    return StatusResponse(**status_data)
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -399,84 +383,28 @@ async def query(request: Request, query_request: QueryRequest):
 
     This endpoint uses Claude with safe tool calling to analyze data.
     """
-    endpoint_logger = get_logger("api.query")
-
-    if not settings.anthropic_api_key:
+    if not query_service:
         raise ConfigurationError(
-            "Anthropic API key not configured",
+            "Query service not initialized",
             details={"setting": "ANTHROPIC_API_KEY"}
         )
 
-    # Initialize orchestrator
-    orchestrator = AnalysisOrchestrator(settings.anthropic_api_key)
+    # Process query through service
+    result = query_service.process_query(
+        question=query_request.question,
+        location=query_request.location
+    )
 
-    try:
-        endpoint_logger.info(
-            f"Processing query: {query_request.question[:100]}...",
-            extra={"location": query_request.location}
-        )
+    # Build response models
+    answer = Answer(**result["answer"])
+    tool_calls = [ToolCall(**tc) for tc in result["tool_calls"]]
 
-        # Get answer
-        result = orchestrator.answer_query(
-            question=query_request.question,
-            location=query_request.location
-        )
-
-        # Transform to response model
-        answer_data = result.get("answer", {})
-
-        # Map confidence string to float (0.0-1.0)
-        confidence_map = {"low": 0.3, "medium": 0.6, "high": 0.9}
-        confidence_value = confidence_map.get(
-            answer_data.get("confidence", "medium"), 0.6
-        )
-
-        # Extract source references
-        sources = [
-            f"{src.get('tool', 'unknown')}({', '.join(f'{k}={v}' for k, v in src.get('params', {}).items())})"
-            for src in answer_data.get("sources", [])
-        ]
-
-        answer = Answer(
-            text=answer_data.get("text", "No response generated"),
-            confidence=confidence_value,
-            sources=sources if sources else None
-        )
-
-        # Transform tool calls
-        tool_calls = [
-            ToolCall(
-                tool_name=tc.get("tool", "unknown"),
-                tool_input=tc.get("params", {}),
-                result=tc.get("result")
-            )
-            for tc in result.get("tool_calls", [])
-        ]
-
-        endpoint_logger.info(
-            f"Query completed in {result.get('rounds', 1)} rounds",
-            extra={"tool_calls": len(tool_calls)}
-        )
-
-        return QueryResponse(
-            answer=answer,
-            tool_calls=tool_calls,
-            rounds=result.get("rounds", 1),
-            model=result.get("model", "unknown")
-        )
-
-    except PydanticValidationError as e:
-        # Pydantic validation errors from response model
-        raise ValidationError(
-            "Failed to construct response",
-            details={"errors": e.errors()}
-        )
-    except KeyError as e:
-        raise DataNotFoundError(
-            f"Missing required data: {e}",
-            details={"key": str(e)}
-        )
-    # Let other exceptions bubble up to global handler
+    return QueryResponse(
+        answer=answer,
+        tool_calls=tool_calls,
+        rounds=result["rounds"],
+        model=result["model"]
+    )
 
 
 @app.post("/query/stream")
@@ -522,7 +450,7 @@ async def query_stream(request: Request, query_request: QueryRequest):
 
 class IngestResponse(BaseModel):
     """Response model for ingestion trigger."""
-    status: str = Field(..., pattern="^(completed|failed|in_progress)$")
+    status: str = Field(..., pattern="^(completed|failed|partial|in_progress)$")
     message: Optional[str] = None
 
 
@@ -534,25 +462,16 @@ async def trigger_ingestion(request: Request):
 
     Note: In production, this endpoint should require authentication.
     """
-    endpoint_logger = get_logger("api.ingest")
+    if not ingestion_service:
+        raise ConfigurationError("Ingestion service not initialized")
 
-    endpoint_logger.info("Manual ingestion triggered")
+    # Trigger ingestion through service
+    result = await ingestion_service.ingest_all()
 
-    try:
-        await update_air_quality()
-        await update_weather()
-
-        endpoint_logger.info("Manual ingestion completed successfully")
-
-        return IngestResponse(
-            status="completed",
-            message="Data ingestion completed successfully"
-        )
-    except (ExternalAPIError, DatabaseError) as e:
-        # These errors are already logged in the background tasks
-        endpoint_logger.error(f"Ingestion failed: {e.message}")
-        raise
-    # Let other exceptions bubble up to global handler
+    return IngestResponse(
+        status=result["status"],
+        message=f"Ingestion {result['status']}: {result.get('timestamp', '')}"
+    )
 
 
 @app.get("/locations")

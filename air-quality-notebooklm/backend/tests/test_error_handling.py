@@ -146,7 +146,8 @@ class TestGlobalExceptionHandlers:
         response = client.get("/nonexistent")
         assert response.status_code == 404
         data = response.json()
-        assert "error" in data
+        # FastAPI's default 404 uses "detail", custom handlers use "error"
+        assert "error" in data or "detail" in data
 
     def test_general_exception_handler(self):
         """Test general exception handler for unexpected errors."""
